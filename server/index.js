@@ -228,8 +228,15 @@ app.use((req, res) => res.status(404).send('見つかりません'));
 let server, jobs;
 async function main() {
   server = app.listen(PORT, () => log('info', 'listening on ' + PORT + ' (' + APP_URL + ')'));
-  await store.init();
-  await mailer.init();
+  // DBの再起動・移行中は、つながるまで待つ（すぐ終了すると再起動の回数上限に達するため）
+  for (let i = 1; ; i++) {
+    try { await store.init(); await mailer.init(); break; }
+    catch (e) {
+      if (i >= 60) throw e;
+      log('warn', 'database not reachable, retrying (' + i + '): ' + e.message);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
   log('info', 'waiting for writer lock');
   await store.acquireWriterLock(() => log('info', '前のインスタンスの終了を待っています'));
   await engine.init();
