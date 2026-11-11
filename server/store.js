@@ -24,20 +24,20 @@ class PgStore {
   constructor(pool, schema) { this.pool = pool; this.schema = schema; this.lockClient = null; }
 
   async init() {
-    const c = await this.pool.connect();
-    try {
-      for (const [name, cols] of Object.entries(this.schema)) {
-        await c.query(`CREATE TABLE IF NOT EXISTS ${q(name)} (id bigint PRIMARY KEY)`);
-        for (const [col, t] of cols) await c.query(`ALTER TABLE ${q(name)} ADD COLUMN IF NOT EXISTS ${q(col)} ${TYPE[t]}`);
-      }
-      await c.query(`CREATE TABLE IF NOT EXISTS app_files (
+    // 1回の往復で流す（DBが遠くても起動が遅くならないように）
+    const sql = [];
+    for (const [name, cols] of Object.entries(this.schema)) {
+      sql.push(`CREATE TABLE IF NOT EXISTS ${q(name)} (id bigint PRIMARY KEY)`);
+      for (const [col, t] of cols) sql.push(`ALTER TABLE ${q(name)} ADD COLUMN IF NOT EXISTS ${q(col)} ${TYPE[t]}`);
+    }
+    sql.push(`CREATE TABLE IF NOT EXISTS app_files (
         id text PRIMARY KEY, name text NOT NULL, mime text NOT NULL, content bytea NOT NULL,
         created_by text, created_at timestamptz NOT NULL DEFAULT now())`);
-      await c.query(`CREATE TABLE IF NOT EXISTS job_runs (job text NOT NULL, run_key text NOT NULL, ran_at timestamptz NOT NULL DEFAULT now(), result text, PRIMARY KEY (job, run_key))`);
-      // よく使う絞り込み用の索引
-      const idx = [['punch_log', 'emp_id, work_date'], ['requests', 'emp_id, work_date'], ['daily', 'emp_id, work_date'], ['monthly', 'emp_id, ym'], ['audit_log', 'at']];
-      for (const [t, cols] of idx) await c.query(`CREATE INDEX IF NOT EXISTS ${q('ix_' + t)} ON ${q(t)} (${cols})`);
-    } finally { c.release(); }
+    sql.push(`CREATE TABLE IF NOT EXISTS job_runs (job text NOT NULL, run_key text NOT NULL, ran_at timestamptz NOT NULL DEFAULT now(), result text, PRIMARY KEY (job, run_key))`);
+    // よく使う絞り込み用の索引
+    const idx = [['punch_log', 'emp_id, work_date'], ['requests', 'emp_id, work_date'], ['daily', 'emp_id, work_date'], ['monthly', 'emp_id, ym'], ['audit_log', 'at']];
+    for (const [t, cols] of idx) sql.push(`CREATE INDEX IF NOT EXISTS ${q('ix_' + t)} ON ${q(t)} (${cols})`);
+    await this.pool.query(sql.join(';\n'));
   }
 
   /** 書き込み担当の確保。取れるまで待つ（前のインスタンスが止まるまで） */
@@ -62,11 +62,14 @@ class PgStore {
   async load() {
     const tables = {};
     for (const [name, cols] of Object.entries(this.schema)) {
-      const max = await this.pool.query(`SELECT COALESCE(MAX(id), 0) AS m FROM ${q(name)}`);
-      const seq = Number(max.rows[0].m);
-      if (WRITE_ONLY.has(name)) { tables[name] = { rows: [], seq, writeOnly: true }; continue; }
+      if (WRITE_ONLY.has(name)) {
+        const max = await this.pool.query(`SELECT COALESCE(MAX(id), 0) AS m FROM ${q(name)}`);
+        tables[name] = { rows: [], seq: Number(max.rows[0].m), writeOnly: true };
+        continue;
+      }
       const r = await this.pool.query(`SELECT * FROM ${q(name)} ORDER BY id`);
-      tables[name] = { rows: r.rows.map(row => fromDb(cols, row)), seq };
+      const rows = r.rows.map(row => fromDb(cols, row));
+      tables[name] = { rows, seq: rows.length ? rows[rows.length - 1]._id : 0 };
     }
     return tables;
   }
