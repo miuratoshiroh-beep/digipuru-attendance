@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>勤怠 | データ取り込み</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#14213a;--mute:#5b6577;--bg:#eef1f5;--card:#fff;--in:#1f5fbf;--out:#b3261e;--line:#d9dee7}
+@media (prefers-color-scheme: dark){:root{--ink:#e7ebf2;--mute:#9aa4b5;--bg:#10151f;--card:#18202d;--in:#7fb0ff;--out:#ff8a80;--line:#2b3546}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:'IBM Plex Sans JP',system-ui,sans-serif;padding:24px 16px}
+main{max-width:720px;margin:0 auto;background:var(--card);border-radius:16px;padding:28px 24px}
+h1{font-size:22px;margin:0 0 8px}
+p,li{color:var(--mute);font-size:14px;line-height:1.8}
+.warn{color:var(--out);font-weight:600}
+label.chk{display:flex;gap:8px;align-items:flex-start;margin:16px 0;font-size:14px;color:var(--ink)}
+input[type=file]{margin:12px 0;font-size:14px}
+button{height:46px;padding:0 20px;border:0;border-radius:10px;background:var(--in);color:#fff;font-weight:600;font-size:15px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+pre{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:13px}
+a{color:var(--in)}
+</style>
+</head>
+<body>
+<main>
+  <h1>データ取り込み</h1>
+  <p>旧スプレッドシート（デジプル勤怠データ）を Excel 形式でダウンロードしたファイル、またはこのシステムの『全データをダウンロード』で保存したファイルを取り込みます。</p>
+  <ul>
+    <li>シート名がテーブル名（employees、rules、holidays、punch_log など）のシートだけを取り込みます。それ以外のシートは無視します</li>
+    <li>1行目の列名で対応づけます。列の並びは問いません</li>
+    <li class="warn">ファイルに含まれるテーブルは、今の内容をすべて消して置き換えます。含まれないテーブルはそのまま残ります</li>
+  </ul>
+  <input type="file" id="file" accept=".xlsx">
+  <label class="chk"><input type="checkbox" id="ok">ファイルに含まれるテーブルを置き換えることを確認しました</label>
+  <button id="go" disabled>取り込む</button>
+  <pre id="out" hidden></pre>
+  <p><a href="/">勤怠の画面へ戻る</a></p>
+</main>
+<script>
+var f = document.getElementById('file'), ok = document.getElementById('ok'), go = document.getElementById('go'), out = document.getElementById('out');
+function sync() { go.disabled = !(f.files.length && ok.checked); }
+f.onchange = sync; ok.onchange = sync;
+go.onclick = function () {
+  go.disabled = true; out.hidden = false; out.textContent = '取り込んでいます…';
+  fetch('/admin/import', { method: 'POST', credentials: 'same-origin', headers: { 'X-Requested-With': 'fetch', 'Content-Type': 'application/octet-stream' }, body: f.files[0] })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (j.error) { out.textContent = '取り込めませんでした：' + j.error; sync(); return; }
+      var r = j.result, lines = ['取り込みました。'];
+      Object.keys(r.counts).forEach(function (k) { lines.push('・' + k + '：' + r.counts[k] + '行'); });
+      if (r.skipped.length) lines.push('', '取り込まなかったシート：' + r.skipped.join('、'));
+      Object.keys(r.unknownColumns).forEach(function (k) { lines.push('使わなかった列（' + k + '）：' + r.unknownColumns[k].join('、')); });
+      if (r.warnings.length) lines.push('', '設定の確認が必要な項目：', r.warnings.join('\n'));
+      out.textContent = lines.join('\n');
+    })
+    .catch(function (e) { out.textContent = '取り込めませんでした：' + e.message; sync(); });
+};
+</script>
+</body>
+</html>

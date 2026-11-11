@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <title>勤怠</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <?!= include('ui/style'); ?>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">勤怠</div>
+    <div class="who"><span id="who"></span><a class="logout" href="/logout">ログアウト</a></div>
+  </header>
+  <nav class="tabs" id="tabs" aria-label="メニュー"></nav>
+  <main id="main" class="main"><p class="loading">読み込んでいます…</p></main>
+  <div id="sheet-root"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <?!= include('ui/app'); ?>
+</body>
+</html>

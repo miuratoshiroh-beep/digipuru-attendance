@@ -1,0 +1,659 @@
+<script>
+/* ===================== 共通 ===================== */
+var DOW = '日月火水木金土';
+var TYPE = { fixed: '固定時間制', flex: 'フレックス', disc: '裁量労働', manager: '管理職' };
+var KIND = { pre: '残業・早出の事前申請', fix: '打刻の修正', leave: '休暇' };
+var STATUS = { pending: ['c', '承認待ち'], approved: ['ok', '承認済み'], rejected: ['x', '差し戻し'], cancelled: ['mute', '取り下げ'] };
+var STAGE = { normal: '通常', caution: '注意', warn: '警告', over: '上限到達' };
+
+function pad(n) { return (n < 10 ? '0' : '') + n; }
+function hm(m) { if (m == null || m === '') return '—'; m = Math.round(m); return Math.floor(m / 60) + ':' + pad(m % 60); }
+function hhmm(m) { if (m == null || m === '') return '--:--'; m = Math.round(m); return pad(Math.floor(m / 60)) + ':' + pad(m % 60); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+function md(s) { return Number(s.slice(5, 7)) + '/' + Number(s.slice(8, 10)); }
+function mdw(s) { var d = new Date(Number(s.slice(0, 4)), Number(s.slice(5, 7)) - 1, Number(s.slice(8, 10))); return md(s) + '（' + DOW[d.getDay()] + '）'; }
+function ymLabel(ym) { return ym.slice(0, 4) + '年' + Number(ym.slice(5)) + '月度'; }
+function addMonths(ym, n) { var d = new Date(Number(ym.slice(0, 4)), Number(ym.slice(5)) - 1 + n, 1); return d.getFullYear() + '-' + pad(d.getMonth() + 1); }
+function $(id) { return document.getElementById(id); }
+
+function call(fn) {
+  var args = Array.prototype.slice.call(arguments, 1);
+  return new Promise(function (resolve, reject) {
+    var r = google.script.run.withSuccessHandler(resolve).withFailureHandler(function (e) { reject(e); });
+    r[fn].apply(r, args);
+  });
+}
+var toastTimer = null;
+function toast(msg, isError) {
+  $('toast').innerHTML = '<div class="' + (isError ? 'error' : '') + '">' + esc(msg) + '</div>';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { $('toast').innerHTML = ''; }, isError ? 7000 : 4000);
+}
+function fail(e) { S.busy = false; toast(e && e.message ? e.message.replace(/^Error:\s*/, '') : String(e), true); render(); }
+
+/* ===================== 状態 ===================== */
+var S = {
+  boot: null, tab: 'punch', busy: false,
+  home: null, month: null, ym: null, viewEmp: null,
+  reqs: null, appr: null, apprYm: null, team: null,
+  admin: null, adminTab: 'close', adminYm: null, emps: null, formResult: null, formTarget: 'ALL',
+  sheet: null, rejecting: null, sel: {},
+  master: null, masterTable: 'employees', mail: null
+};
+
+function curYm() { return S.boot.today.slice(0, 7); }
+
+/* ===================== 打刻 ===================== */
+// 端末のタイムゾーンに関係なく日本時間で表示する
+function jstNow() { var d = new Date(Date.now() + 9 * 3600000); return { h: d.getUTCHours(), m: d.getUTCMinutes(), s: d.getUTCSeconds() }; }
+function nowMinClient() { var d = jstNow(); return d.h * 60 + d.m; }
+function strip(h) {
+  var t = h.today, e = h.emp, L = 360, W = 1080;
+  function x(m) { return +(((Math.min(Math.max(m, L), L + W) - L) / W) * 100).toFixed(2); }
+  var s = '<div class="strip" aria-hidden="true"><div class="axis"></div>';
+  if (e.work_type === 'fixed') s += '<div class="band" style="left:' + x(e.sched_start) + '%;width:' + (x(e.sched_end) - x(e.sched_start)) + '%"></div>';
+  if (t.preEnd != null || t.preStart != null) { var ps = t.preStart != null ? t.preStart : e.sched_start, pe = t.preEnd != null ? t.preEnd : e.sched_end; s += '<div class="plan" style="left:' + x(ps) + '%;width:' + (x(pe) - x(ps)) + '%"></div>'; }
+  s += '<div class="brk" style="left:' + x(S.boot.rules.lunch_start) + '%;width:' + (x(S.boot.rules.lunch_end) - x(S.boot.rules.lunch_start)) + '%"></div>';
+  if (t.punchIn != null) {
+    var end = t.punchOut != null ? t.punchOut : Math.max(t.punchIn, nowMinClient());
+    s += '<div class="span" style="left:' + x(t.punchIn) + '%;width:' + (x(end) - x(t.punchIn)).toFixed(2) + '%"></div>';
+    s += '<div class="mk in" style="left:' + x(t.punchIn) + '%"><span>出 ' + hhmm(t.punchIn) + '</span></div>';
+    if (t.punchOut != null) s += '<div class="mk out" style="left:' + x(t.punchOut) + '%"><span>退 ' + hhmm(t.punchOut) + '</span></div>';
+  }
+  [6, 9, 12, 15, 18, 21, 24].forEach(function (hr) { s += '<span class="tick" style="left:' + x(hr * 60) + '%">' + hr + '</span>'; });
+  return s + '</div>';
+}
+function gaugeBar(v, max, ticks, cls) {
+  return '<div class="gauge" role="img" aria-label="' + hm(v) + '／' + hm(max) + '"><div class="fill ' + cls + '" style="width:' + Math.min(100, v / max * 100) + '%"></div>' +
+    ticks.map(function (t) { return '<i style="left:' + (t / max * 100) + '%"></i>'; }).join('') + '</div>';
+}
+function gaugeBlock(h) {
+  var t = h.totals, e = h.emp, an = h.annual, s = '';
+  if (e.work_type === 'flex') {
+    var over = t.projected > t.frame;
+    s += '<h3 class="sec">今月の労働時間（フレックス・月末に確定）</h3><div class="g-val"><b class="num">' + hm(t.done) + '</b><span>見込み ' + hm(t.projected) + '／法定総枠 ' + hm(t.frame) + '</span></div>' +
+      gaugeBar(t.projected, t.frame * 1.15, [t.sched, t.frame], over ? 'warn' : '') +
+      '<p class="note">所定 ' + hm(t.sched) + '・法定総枠 ' + hm(t.frame) + '。見込みが総枠を超えた分が残業になります' + (over ? '（現在の見込み ' + hm(t.legalOt) + '）' : '') + '</p>';
+  } else if (e.work_type === 'disc' || e.work_type === 'manager') {
+    s += '<h3 class="sec">今月の残業（見做し）</h3><div class="g-val"><b class="num">' + hm(t.ot36) + '</b><span>上限 ' + hm(t.limit) + '</span></div>' +
+      '<h3 class="sec">健康管理の目安（実労働の8時間超過分）</h3><div class="g-val"><b class="num">' + hm(t.health) + '</b><span>基準 80:00</span></div>' +
+      gaugeBar(t.health, 4800, [2700], t.health > 4800 ? 'over' : t.health > 2700 ? 'warn' : '');
+  } else {
+    s += '<h3 class="sec">今月の残業（日8時間超＋週40時間超）</h3><div class="g-val"><b class="num">' + hm(t.ot36) + '</b><span>上限 ' + hm(t.limit) + '　<span class="pill ' + t.stage + '">' + STAGE[t.stage] + '</span></span></div>' +
+      gaugeBar(t.ot36, t.limit, [t.limit * 0.75, t.limit * 0.9], t.stage === 'normal' ? '' : t.stage) +
+      '<p class="note">上限の75%で注意、90%で警告のメールが届きます</p>';
+  }
+  s += '<p class="note" style="margin-top:8px">年間累計 <b class="num">' + hm(an.total) + '</b>／720:00　上限を超えた月 ' + an.overCount + '／6回</p>';
+  return s;
+}
+function viewPunch() {
+  var h = S.home;
+  if (!h) return '<p class="loading">読み込んでいます…</p>';
+  var t = h.today, e = h.emp, st = h.state, status = '';
+  if (st === 'before') status = '<span class="pill mute">未出勤</span>まだ出勤の打刻がありません';
+  if (st === 'on') status = '<span class="pill in">勤務中</span>出勤 ' + hhmm(t.punchIn) + '　経過 <span id="elapsed" class="num">' + hm(Math.max(0, nowMinClient() - t.punchIn)) + '</span>';
+  if (st === 'on_yesterday') status = '<span class="pill in">勤務中（前日から）</span>退勤を押すと前日の退勤として記録されます';
+  if (st === 'done') status = '<span class="pill out">退勤済み</span>' + hhmm(t.punchIn) + '〜' + hhmm(t.punchOut);
+  if (t.staggered) status += ' <span class="pill c">時差出勤</span>';
+  if (t.preEnd != null) status += ' <span class="pill in">終業予定 ' + hhmm(t.preEnd) + '</span>';
+  var al = '';
+  h.issues.forEach(function (x) {
+    if (x.flag === 'DEVIATION') al += '<div class="alert"><b>' + mdw(x.date) + ' の退勤 ' + hhmm(x.punchOut) + ' が終業予定（' + hhmm(x.planEnd) + '）より遅れています</b><br>業務だった場合は残業の事後申請、業務外の場合は理由を入力してください。<div class="act"><button class="link-btn" data-act="openDay" data-arg="' + x.date + '">入力する</button></div></div>';
+    else al += '<div class="alert"><b>' + mdw(x.date) + ' の' + (x.flag === 'NO_RECORD' ? '出退勤の記録' : x.label.replace('未打刻', 'の打刻')) + 'がありません</b><div class="act"><button class="link-btn" data-act="newFix" data-arg="' + x.date + '">修正を申請する</button><button class="link-btn" data-act="newLeave" data-arg="' + x.date + '">休暇を申請する</button></div></div>';
+  });
+  var ps = h.prev.status;
+  if (!ps.confirmed && !ps.closed) {
+    var late = h.date > h.prev.deadline;
+    al += '<div class="alert ' + (late ? '' : 'info') + '"><b>' + ymLabel(h.prev.ym) + 'の勤怠が未確定です</b><br>確定期限は ' + mdw(h.prev.deadline) + 'です' + (late ? '（期限を過ぎています）' : '') + '。<div class="act"><button class="link-btn" data-act="goMonth" data-arg="' + h.prev.ym + '">確認して確定する</button></div></div>';
+  }
+  var canIn = st === 'before', canOut = st === 'on' || st === 'on_yesterday';
+  return '<p class="today">' + h.date.slice(0, 4) + '年' + mdw(h.date) + '・' + TYPE[e.work_type] + '</p>' +
+    '<p class="clock num" id="clock">--:--</p><p class="status">' + status + '</p>' +
+    '<div class="punch"><button class="p-in" data-act="punch" data-arg="IN" ' + (canIn && !S.busy ? '' : 'disabled') + '>出勤</button>' +
+    '<button class="p-out" data-act="punch" data-arg="OUT" ' + (canOut && !S.busy ? '' : 'disabled') + '>退勤</button></div>' +
+    strip(h) +
+    '<div class="legend">' + (e.work_type === 'fixed' ? '<span><i style="background:#dde3ea"></i>所定 ' + hhmm(e.sched_start) + '〜' + hhmm(e.sched_end) + '</span>' : '') +
+    '<span><i style="background:repeating-linear-gradient(135deg,#c3ccd7 0 3px,transparent 3px 6px)"></i>昼休</span>' +
+    (t.preEnd != null || t.preStart != null ? '<span><i style="border:1.5px dashed var(--in)"></i>事前申請の範囲</span>' : '') + '</div>' +
+    '<div class="result"><div><b class="num">' + (t.punchOut != null ? hm(t.work) : '—') + '</b><span>実労働</span></div>' +
+    '<div><b class="num">' + (t.punchOut != null ? (e.work_type === 'flex' ? '月末' : hm(t.r)) : '—') + '</b><span>残業（当日）</span></div>' +
+    '<div><b class="num">' + (t.punchOut != null ? hm(t.night) : '—') + '</b><span>深夜</span></div></div>' +
+    (e.work_type === 'fixed' && st !== 'done' ? '<button class="btn ghost block" data-act="newPre" data-arg="' + h.date + '" style="margin-bottom:14px">今日の残業・早出を事前申請する</button>' : '') +
+    al + gaugeBlock(h);
+}
+
+/* ===================== マイ勤怠（承認者・管理者は他の社員も閲覧） ===================== */
+function viewLog() {
+  var m = S.month;
+  if (!m) return '<p class="loading">読み込んでいます…</p>';
+  var t = m.totals, e = m.emp, st = m.status, ym = m.ym, own = !S.viewEmp;
+  var banner = '';
+  if (!own) banner += '<div class="alert info"><b>' + esc(e.name) + ' さんの勤怠（閲覧のみ）</b><div class="act"><button class="link-btn" data-act="backFromEmp">戻る</button></div></div>';
+  if (st.closed) banner += '<div class="alert info">' + ymLabel(ym) + 'は締め済みです。内容の変更や申請はできません</div>';
+  else if (ym < m.today.slice(0, 7)) {
+    if (!st.confirmed) banner += own ? '<div class="alert"><b>内容を確認して確定してください</b><br>確定すると承認者に通知されます。打刻漏れ・乖離理由の未入力・承認待ちの申請があると確定できません。<div class="act"><button class="btn primary block" data-act="confirm" ' + (S.busy ? 'disabled' : '') + '>' + ymLabel(ym) + 'を確定する</button></div></div>' : '<div class="alert">本人がまだ確定していません</div>';
+    else if (!st.approved) banner += '<div class="alert info">確定済みです。承認者の承認を待っています</div>';
+    else banner += '<div class="alert info">承認済みです。経理の締めを待っています</div>';
+  }
+  var list = m.rows.map(function (d) {
+    var future = d.date > m.today, dw = d.dow, tx = '';
+    if (d.leaveType && !d.work) tx = '<span class="pill in">' + esc(d.leaveName) + '</span>';
+    else if (d.punchIn != null || d.punchOut != null) tx = '<span class="num">' + hhmm(d.punchIn) + '–' + hhmm(d.punchOut) + '</span>' + (d.leaveType ? ' <span class="pill in">' + esc(d.leaveName) + '</span>' : '');
+    else tx = d.type === 'work' ? (future ? (d.preEnd != null ? '<span class="pill in">終業予定 ' + hhmm(d.preEnd) + '</span>' : '') : '—') : (d.holidayName || (d.type === 'legal' ? '法定休日' : '所定休日'));
+    d.flagLabels.forEach(function (f, i) { tx += ' <span class="pill ' + (d.flags[i] === 'EDITED' ? 'mute' : 'x') + '">' + f + '</span>'; });
+    if (m.pending[d.date]) tx += ' <span class="pill c">申請中</span>';
+    var ot = d.r + d.w40;
+    return '<li><button class="day ' + (d.type !== 'work' && !d.work ? 'off' : '') + (future ? ' future' : '') + '" data-act="openDay" data-arg="' + d.date + '">' +
+      '<span class="d ' + (dw === 6 ? 'sat' : dw === 0 || d.holidayName ? 'sun' : '') + '">' + Number(d.date.slice(8)) + '<small>' + DOW[dw] + '</small></span>' +
+      '<span class="t">' + tx + '</span>' +
+      '<span class="n num">' + (d.work ? hm(d.work) : '') + '<small>' + (d.work ? '実労働' : '') + '</small></span>' +
+      '<span class="n num">' + (e.work_type === 'flex' ? '' : (ot ? hm(ot) : '')) + '<small>' + (ot && e.work_type !== 'flex' ? '残業' : '') + '</small></span></button></li>';
+  }).join('');
+  return '<div class="monthnav"><button data-act="month" data-arg="-1" aria-label="前の月">‹</button><b>' + ymLabel(ym) + '</b><button data-act="month" data-arg="1" aria-label="次の月" ' + (ym >= m.today.slice(0, 7) ? 'disabled' : '') + '>›</button></div>' +
+    banner +
+    '<div class="sum"><div><span>出勤日数</span><b class="num">' + t.workDays + '日</b></div><div><span>実労働</span><b class="num">' + hm(t.work) + '</b></div>' +
+    '<div><span>残業' + (e.work_type === 'flex' && t.projection ? '（見込）' : '') + '</span><b class="num">' + hm(t.ot36) + '</b></div>' +
+    '<div><span>うち週40h超</span><b class="num">' + hm(t.w40) + '</b></div><div><span>深夜</span><b class="num">' + hm(t.night) + '</b></div>' +
+    '<div><span>有休・他の休</span><b class="num">' + (t.paid + t.other) + '日</b></div></div>' +
+    (e.work_type === 'fixed' && t.lack ? '<p class="note" style="margin-bottom:8px">不足 <b class="num">' + hm(t.lack) + '</b>：休日出勤で充当 ' + hm(t.lackHol) + '・残業で充当 ' + hm(t.lackOt) + '・未充当 <b class="num" style="color:' + (t.lackLeft ? 'var(--out)' : 'inherit') + '">' + hm(t.lackLeft) + '</b>（同じ月の中で充当）</p>' : '') +
+    (e.work_type === 'flex' ? '<p class="note" style="margin-bottom:8px">法定総枠 ' + hm(t.frame) + '・所定 ' + hm(t.sched) + '。残業は月末に確定します</p>' : '') +
+    '<ul class="days">' + list + '</ul>';
+}
+
+/* ===================== 日の詳細・入力シート ===================== */
+function findDay(date) { return S.month && S.month.rows.filter(function (d) { return d.date === date; })[0]; }
+function sheetDay(date) {
+  var m = S.month, d = findDay(date), e = m.emp, own = !S.viewEmp;
+  if (!d) return '';
+  var fixed = e.work_type === 'fixed', closed = m.status.closed, past = date <= m.today;
+  var issues = d.flags.filter(function (f) { return f !== 'EDITED' && f !== 'BREAK_SHORT'; });
+  var planEnd = planEndOf(e, d);
+  var h = '<h2>' + mdw(date) + '</h2><p class="sub">' + (d.holidayName || { work: '平日', company: '所定休日', legal: '法定休日' }[d.type]) + '・' + TYPE[e.work_type] + '</p>' +
+    '<dl class="kv"><dt class="grp">入退出（打刻）</dt><dt>出勤・退勤</dt><dd class="num">' + hhmm(d.punchIn) + ' 〜 ' + hhmm(d.punchOut) + (d.staggered ? ' <span class="pill c">時差出勤</span>' : '') + '</dd>' +
+    (fixed ? '<dt class="grp">①残業事前申請</dt><dt>早出・終業予定</dt><dd class="num">' + (d.preStart != null || d.preEnd != null ? (d.preStart != null ? hhmm(d.preStart) : '—') + ' 〜 ' + (d.preEnd != null ? hhmm(d.preEnd) : '—') + '　' + esc(d.preReason) + '<br><small>' + esc(d.preApprover) + '</small>' : 'なし') + '</dd>' : '') +
+    '<dt class="grp">②就業時間（帳票に記載する時間）</dt><dt>開始 a・終了 b</dt><dd class="num">' + (d.a != null ? hhmm(d.a) + ' 〜 ' + hhmm(d.b) : '—') + '</dd>' +
+    '<dt>休憩</dt><dd class="num">' + hm(d.lunch + d.extraBreak) + (d.extraBreak ? '（うち③休憩等 ' + hm(d.extraBreak) + '）' : '') + '</dd>' +
+    '<dt>実労働</dt><dd class="num">' + hm(d.work) + '</dd>' +
+    '<dt>④残業（当日）</dt><dd class="num">' + (e.work_type === 'flex' ? '月末に確定' : hm(d.r)) + ((e.work_type === 'disc' || e.work_type === 'manager') && d.type === 'work' ? '（見做し）' : '') + '</dd>' +
+    '<dt>週40h超・深夜</dt><dd class="num">' + hm(d.w40) + '・' + hm(d.night) + '</dd>' +
+    (d.hol ? '<dt>休日労働</dt><dd class="num">' + hm(d.hol) + '</dd>' : '') +
+    (d.leaveType ? '<dt>出勤状況</dt><dd>' + esc(d.leaveName) + '</dd>' : '') +
+    (d.makeup ? '<dt>中抜けの補填</dt><dd class="num">終業後 ' + hm(d.makeup) + '（残業にしない）</dd>' : '') +
+    (d.note ? '<dt>⑥備考</dt><dd>' + esc(d.note) + '</dd>' : '') + '</dl>' + offsetBox(d);
+  if (issues.length || d.flags.indexOf('BREAK_SHORT') >= 0) h += '<p class="err" style="margin-top:10px">' + d.flagLabels.filter(function (f) { return f !== '修正済'; }).join('・') + '</p>';
+  if (fixed && d.punchIn != null && d.punchIn < e.sched_start && d.preStart == null) h += '<p class="note" style="margin:8px 0">始業前（' + hhmm(d.punchIn) + '〜' + hhmm(e.sched_start) + '）は就業時間に含めていません。早出として計上するには事前申請（事後も可）が必要です</p>';
+  if (m.pending[date]) h += '<p class="note" style="margin:8px 0">この日の申請が承認待ちです</p>';
+  if (own && !closed) {
+    if (d.flags.indexOf('DEVIATION') >= 0 && !m.pending[date]) {
+      h += '<div class="alert" style="margin-top:10px"><b>退勤 ' + hhmm(d.punchOut) + ' は終業予定（' + hhmm(planEnd) + '）より遅れています</b><div class="row-btns">' +
+        '<button class="btn primary" data-act="newPre" data-arg="' + date + '" data-post="1">業務だった：残業を事後申請</button>' +
+        '<button class="btn ghost" data-act="devForm" data-arg="' + date + '">業務外だった：理由を入力</button></div></div>';
+    }
+    if (d.deviation === 'non_work') h += '<div class="row-btns"><button class="btn ghost sm" data-act="devClear" data-arg="' + date + '">「業務外」の申告を取り消す</button></div>';
+    h += '<div class="row-btns">' +
+      (past && d.punchOut != null ? '<button class="btn ghost" data-act="brkForm" data-arg="' + date + '">③休憩等を入力</button>' : '') +
+      (past ? '<button class="btn ghost" data-act="newFix" data-arg="' + date + '">打刻の修正を申請</button>' : '') +
+      (fixed ? '<button class="btn ghost" data-act="newPre" data-arg="' + date + '">残業・早出を申請</button>' : '') +
+      '<button class="btn ghost" data-act="newLeave" data-arg="' + date + '">休暇を申請</button></div>';
+  }
+  return h + '<div class="row-btns"><button class="btn ghost" data-act="closeSheet">閉じる</button></div>';
+}
+function planEndOf(e, d) { return Math.max(e.sched_end + (S.boot.rules.makeup_enabled ? (d.extraBreak || 0) : 0), d.preEnd || 0); }
+function offsetBox(d) {
+  if (!d.lack && !(d.offsetTo && d.offsetTo.length)) return '';
+  var s = '<div class="offset">';
+  if (d.lack) {
+    s += '<b>不足 ' + hm(d.lack) + '</b>（遅刻・早退・中抜けで所定に届かない時間）<br>';
+    s += d.offsetFrom.map(function (o) { return mdw(o.date) + 'の' + (o.kind === 'hol' ? '休日出勤' : '残業') + ' ' + hm(o.min) + 'で充当'; }).join('<br>');
+    if (d.lack > d.filled) s += (d.offsetFrom.length ? '<br>' : '') + '<span style="color:var(--out)">未充当 ' + hm(d.lack - d.filled) + '（同じ月の休日出勤・残業がなければ控除対象）</span>';
+  }
+  if (d.offsetTo && d.offsetTo.length) s += (d.lack ? '<br>' : '') + d.offsetTo.map(function (o) { return mdw(o.date) + 'の不足に ' + hm(o.min) + ' 充当'; }).join('<br>') + '<br><small>充当した時間にも割増（週40h超・深夜・法定休日）は付きます</small>';
+  return s + '</div>';
+}
+function sheetDev(sh) {
+  var d = findDay(sh.date), e = S.month.emp;
+  return '<h2>業務外だった理由を入力</h2><p class="sub">' + mdw(sh.date) + '　就業時間の終了は ' + hhmm(planEndOf(e, d)) + ' として記録し、理由は帳票の⑥備考（入退出記録との相違理由）に載ります</p>' +
+    '<label class="field"><span>理由</span><textarea data-f="note" maxlength="60" placeholder="例：退社19時 業後雑談">' + esc(sh.note || '') + '</textarea></label>' +
+    (sh.err ? '<p class="err" role="alert">' + esc(sh.err) + '</p>' : '') +
+    '<div class="row-btns"><button class="btn ghost" data-act="closeSheet">やめる</button><button class="btn primary" data-act="saveDev" ' + (S.busy ? 'disabled' : '') + '>記録する</button></div>';
+}
+function sheetBrk(sh) {
+  var opts = [0, 15, 30, 45, 60, 90, 120, 150, 180, 240];
+  return '<h2>③休憩等（昼休以外）を入力</h2><p class="sub">' + mdw(sh.date) + '　私用など業務以外の時間の合計。労働時間から差し引き、事由は⑥備考に載ります' + (S.boot.rules.makeup_enabled ? '。中抜けした分は、残業申請なしで終業後に同じ時間だけ勤務して埋められます（例：1:00抜けたら18:30まで）' : '') + '</p>' +
+    '<label class="field"><span>時間</span><select data-f="min">' + opts.map(function (v) { return '<option value="' + v + '" ' + (+sh.min === v ? 'selected' : '') + '>' + (v ? hm(v) : 'なし') + '</option>'; }).join('') + '</select></label>' +
+    '<label class="field"><span>事由</span><input data-f="note" maxlength="60" value="' + esc(sh.note || '') + '" placeholder="例：私用1時間"></label>' +
+    (sh.err ? '<p class="err" role="alert">' + esc(sh.err) + '</p>' : '') +
+    '<div class="row-btns"><button class="btn ghost" data-act="closeSheet">やめる</button><button class="btn primary" data-act="saveBrk" ' + (S.busy ? 'disabled' : '') + '>記録する</button></div>';
+}
+function sheetForm(sh) {
+  var fixed = S.boot.me.work_type === 'fixed', k = sh.fkind;
+  var seg = '<div class="seg" role="group" aria-label="申請の種類">' +
+    (fixed ? '<button aria-pressed="' + (k === 'pre') + '" data-act="formKind" data-arg="pre">事前申請</button>' : '') +
+    '<button aria-pressed="' + (k === 'fix') + '" data-act="formKind" data-arg="fix">打刻の修正</button>' +
+    '<button aria-pressed="' + (k === 'leave') + '" data-act="formKind" data-arg="leave">休暇</button></div>';
+  var body = '';
+  if (k === 'pre') body = '<div class="two"><label class="field"><span>早出開始（始業より前・' + S.boot.rules.ot_unit_min + '分単位）</span><input type="time" step="1800" data-f="preStart" value="' + esc(sh.preStart || '') + '"></label>' +
+    '<label class="field"><span>終業予定（終業より後・' + S.boot.rules.ot_unit_min + '分単位）</span><input type="time" step="1800" data-f="preEnd" value="' + esc(sh.preEnd || '') + '"></label></div>' +
+    '<p class="note" style="margin:-4px 0 10px">終業予定は退勤時刻を' + S.boot.rules.ot_unit_min + '分単位で切り捨てた時刻です（例：18:40・18:50に退勤 → 18:30、19:10 → 19:00）' + (sh.date && sh.date < S.boot.today ? '。事後申請として送ります' : '') + '</p>';
+  else if (k === 'fix') body = '<div class="two"><label class="field"><span>出勤</span><input type="time" data-f="inTime" value="' + esc(sh.inTime || '') + '"></label>' +
+    '<label class="field"><span>退勤（翌日の場合は 25:30 のように入力）</span><input data-f="outTime" inputmode="numeric" placeholder="例 18:40" value="' + esc(sh.outTime || '') + '"></label></div>';
+  else body = '<label class="field"><span>休暇の種類</span><select data-f="leaveType">' + S.boot.leaveTypes.map(function (t) { return '<option value="' + t.key + '" ' + (sh.leaveType === t.key ? 'selected' : '') + '>' + esc(t.name) + '</option>'; }).join('') + '</select></label>';
+  return '<h2>申請する</h2><p class="sub">承認者が承認すると勤怠に反映されます</p>' + seg +
+    '<label class="field"><span>対象日</span><input type="date" data-f="date" data-refill="1" value="' + esc(sh.date || '') + '"></label>' + body +
+    '<label class="field"><span>' + (k === 'pre' ? '理由（業務内容）' : '理由') + '</span><textarea data-f="reason" maxlength="200" placeholder="' + (k === 'pre' ? '例：見積作成' : k === 'fix' ? '例：退勤時に打刻を忘れたため' : '例：私用のため') + '">' + esc(sh.reason || '') + '</textarea></label>' +
+    (sh.err ? '<p class="err" role="alert">' + esc(sh.err) + '</p>' : '') +
+    '<div class="row-btns"><button class="btn ghost" data-act="closeSheet">やめる</button><button class="btn primary" data-act="submit" ' + (S.busy ? 'disabled' : '') + '>申請する</button></div>';
+}
+function openForm(kind, date, post) {
+  if (kind === 'pre' && S.boot.me.work_type !== 'fixed') kind = 'fix';
+  var d = date && findDay(date);
+  S.sheet = { kind: 'form', fkind: kind, date: date || '', reason: '', leaveType: 'paid_full', err: '' };
+  fillFromDay(S.sheet, d, post);
+}
+function fillFromDay(sh, d, post) {
+  sh.inTime = d && d.punchIn != null ? hhmm(d.punchIn) : '';
+  sh.outTime = d && d.punchOut != null ? hhmm(d.punchOut) : '';
+  sh.preStart = d && d.preStart != null ? hhmm(d.preStart) : '';
+  var u = (S.boot && S.boot.rules.ot_unit_min) || 1;
+  // 事後申請は退勤打刻を申請単位で切り捨てた時刻を初期値にする（18:40 → 18:30）
+  sh.preEnd = post && d && d.punchOut != null ? hhmm(Math.floor(d.punchOut / u) * u) : (d && d.preEnd != null ? hhmm(d.preEnd) : '');
+}
+
+/* ===================== 申請一覧 ===================== */
+function reqCard(r, forAppr) {
+  var st = STATUS[r.status] || ['mute', r.status], body = '';
+  if (r.kind === 'fix') {
+    var row = function (lab, before, after) { return after ? '<span>' + lab + '</span><span class="num">' + (before == null ? '未打刻' : '<s>' + hhmm(before) + '</s>') + ' → <b>' + esc(after) + '</b></span>' : ''; };
+    body = '<div class="diff">' + row('出勤', r.before && r.before.in, r.in_time) + row('退勤', r.before && r.before.out, r.out_time) + '</div>';
+  } else if (r.kind === 'pre') {
+    body = '<div class="diff">' + (r.pre_start ? '<span>早出開始</span><b class="num">' + esc(r.pre_start) + '</b>' : '') + (r.pre_end ? '<span>終業予定</span><b class="num">' + esc(r.pre_end) + '</b>' : '') + (r.is_post ? '<span>区分</span><span>事後申請</span>' : '') + '</div>';
+  } else body = '<div class="diff"><span>休暇</span><b>' + esc(r.leaveName) + '</b></div>';
+  var rej = S.rejecting === r.req_id, selectable = forAppr && r.status === 'pending';
+  var title = '<b>' + (forAppr ? esc(r.empName) + '　' : '') + KIND[r.kind] + '　' + mdw(r.work_date) + '</b>';
+  if (selectable) title = '<label class="chk"><input type="checkbox" data-sel="' + r.req_id + '" ' + (S.sel[r.req_id] ? 'checked' : '') + ' aria-label="一括承認の対象にする">' + title + '</label>';
+  return '<div class="card' + (selectable && S.sel[r.req_id] ? ' sel' : '') + '"><div class="top2">' + title + '<span class="pill ' + st[0] + '">' + st[1] + '</span></div>' + body +
+    '<p class="meta">理由：' + esc(r.reason) + '</p>' + (r.comment ? '<p class="meta" style="color:var(--out)">コメント：' + esc(r.comment) + '</p>' : '') +
+    '<p class="meta">申請 ' + esc(r.created_at.slice(5, 16).replace('T', ' ')) + (r.approver_name && r.status !== 'pending' ? '　処理 ' + esc(r.approver_name) : '') + '</p>' +
+    (forAppr && r.status === 'pending' ? (rej
+      ? '<label class="field" style="margin-top:8px"><span>差し戻す理由</span><textarea id="rejectComment" maxlength="200"></textarea></label><div class="row-btns"><button class="btn ghost" data-act="rejectCancel">やめる</button><button class="btn primary" data-act="rejectSend" data-arg="' + r.req_id + '" ' + (S.busy ? 'disabled' : '') + '>差し戻す</button></div>'
+      : '<div class="row-btns"><button class="btn ghost" data-act="reject" data-arg="' + r.req_id + '">差し戻す</button><button class="btn primary" data-act="approve" data-arg="' + r.req_id + '" ' + (S.busy ? 'disabled' : '') + '>承認する</button></div>') : '') +
+    (!forAppr && r.status === 'pending' ? '<div class="row-btns"><button class="btn ghost sm" data-act="cancelReq" data-arg="' + r.req_id + '">取り下げる</button></div>' : '') +
+    '</div>';
+}
+function viewApply() {
+  if (!S.reqs) return '<p class="loading">読み込んでいます…</p>';
+  return '<button class="btn primary block" data-act="newApp" style="margin-bottom:14px">新しく申請する</button>' +
+    (S.reqs.length ? S.reqs.map(function (r) { return reqCard(r, false); }).join('') : '<p class="note">申請はまだありません。残業・早出の事前申請、打刻の修正、休暇はここから申請できます。</p>');
+}
+
+/* ===================== 承認 ===================== */
+function viewApprove() {
+  var a = S.appr;
+  if (!a) return '<p class="loading">読み込んでいます…</p>';
+  var nSel = selectedIds().length, all = a.pending.length && nSel === a.pending.length;
+  var h = '<h3 class="sec" style="margin-top:0">承認待ちの申請（' + a.pending.length + '件）</h3>' +
+    (a.pending.length > 1 ? '<div class="bulkbar"><label><input type="checkbox" data-selall="1" ' + (all ? 'checked' : '') + '>すべて選択</label>' +
+      '<button class="btn primary sm" data-act="approveBulk" ' + (!nSel || S.busy ? 'disabled' : '') + '>' + (nSel ? '選択した' + nSel + '件を承認' : '承認する申請を選択') + '</button></div>' : '') +
+    (a.pending.length ? a.pending.map(function (r) { return reqCard(r, true); }).join('') : '<p class="note">承認待ちの申請はありません</p>');
+  h += '<div class="monthnav" style="margin-top:18px"><button data-act="apprMonth" data-arg="-1" aria-label="前の月">‹</button><b>' + ymLabel(a.ym) + 'の勤怠</b><button data-act="apprMonth" data-arg="1" aria-label="次の月" ' + (a.ym >= curYm() ? 'disabled' : '') + '>›</button></div>';
+  var ready = a.months.filter(function (x) { return x.status.confirmed && !x.status.approved && !x.status.closed; });
+  if (ready.length > 1) h += '<div class="bulkbar"><span>確定済み・未承認 ' + ready.length + '名</span><button class="btn primary sm" data-act="approveMonthBulk" ' + (S.busy ? 'disabled' : '') + '>' + ready.length + '名をまとめて承認</button></div>';
+  h += a.months.map(function (x) {
+    var r;
+    if (x.status.closed) r = '<span class="pill mute">締め済み</span>';
+    else if (!x.status.confirmed) r = '<span class="pill c">本人未確定</span>';
+    else if (!x.status.approved) r = '<button class="btn primary sm" data-act="approveMonth" data-arg="' + x.emp.emp_id + '" ' + (S.busy ? 'disabled' : '') + '>承認する</button>';
+    else r = '<span class="pill ok">承認済み</span>';
+    return '<div class="card"><div class="top2"><b>' + esc(x.emp.name) + '</b>' + r + '</div><p class="meta">' + TYPE[x.emp.work_type] + '　実労働 ' + hm(x.totals.work) + '　残業 ' + hm(x.totals.ot36) + '　割増 ' + hm(x.totals.premium) +
+      (x.totals.lack ? '　不足 ' + hm(x.totals.lack) + '（充当 ' + hm(x.totals.lack - x.totals.lackLeft) + '・控除対象 ' + hm(x.totals.lackLeft) + '）' : '') +
+      (x.totals.issues ? '　<span style="color:var(--out)">要対応 ' + x.totals.issues + '日</span>' : '') + '</p>' +
+      '<div class="row-btns"><button class="btn ghost sm" data-act="viewEmp" data-arg="' + x.emp.emp_id + '" data-ym="' + a.ym + '">日別を見る</button></div></div>';
+  }).join('');
+  if (S.team) {
+    h += '<h3 class="sec">今月の状況</h3>' + S.team.map(function (x) {
+      var t = x.totals, e = x.emp, isD = e.work_type === 'disc' || e.work_type === 'manager';
+      var v = isD ? t.health : t.ot36, max = isD ? 4800 : t.limit;
+      var stLabel = t.health > 4800 ? '健康：80h超' : STAGE[t.stage];
+      return '<div class="card"><div class="top2"><b>' + esc(e.name) + '</b><span class="pill ' + (t.health > 4800 ? 'over' : t.stage) + '">' + stLabel + '</span></div>' +
+        '<p class="meta">' + TYPE[e.work_type] + '　' + (e.work_type === 'flex' ? '見込み残業 ' + hm(t.legalOt) : isD ? '実労働の超過 ' + hm(t.health) + '（80hで面接案内）' : '残業 ' + hm(t.ot36) + '／' + hm(t.limit)) + '</p>' +
+        gaugeBar(v, max, [], t.stage === 'normal' ? '' : t.stage) +
+        '<p class="meta">年間累計 ' + hm(x.annual.total) + '／720:00　上限超の月 ' + x.annual.overCount + '／6回' + (t.issues ? '　<span style="color:var(--out)">要対応 ' + t.issues + '日</span>' : '') + (x.pending ? '　申請中 ' + x.pending + '件' : '') + '</p></div>';
+    }).join('');
+  }
+  return h;
+}
+
+/* ===================== 管理 ===================== */
+function viewAdmin() {
+  var tabs = '<div class="seg" style="max-width:520px"><button aria-pressed="' + (S.adminTab === 'close') + '" data-act="adminTab" data-arg="close">月次締め・帳票</button><button aria-pressed="' + (S.adminTab === 'ot') + '" data-act="adminTab" data-arg="ot">残業表・36協定</button><button aria-pressed="' + (S.adminTab === 'emp') + '" data-act="adminTab" data-arg="emp">マスタ・保守</button></div>';
+  if (S.adminTab === 'emp') return tabs + viewMaster();
+  var a = S.admin;
+  var nav = '<div class="monthnav" style="max-width:360px"><button data-act="adminMonth" data-arg="-1" aria-label="前の月">‹</button><b>' + ymLabel(S.adminYm) + '</b><button data-act="adminMonth" data-arg="1" aria-label="次の月" ' + (S.adminYm >= curYm() ? 'disabled' : '') + '>›</button></div>';
+  if (!a || a.ym !== S.adminYm) return tabs + nav + '<p class="loading">読み込んでいます…</p>';
+  if (S.adminTab === 'ot') {
+    return tabs + nav + '<p class="note" style="margin-bottom:8px">残業＝日8時間超＋週40時間超。フレックスの当月分は月末までの見込み。月の上限：一般42時間、管理職・営業・裁量労働40時間。上限を超える月は年6回まで、年間720時間まで</p>' +
+      '<div class="tbl-wrap"><table class="t"><tr><th>氏名</th><th class="l">勤務区分</th><th>上限</th><th>残業</th><th>うち週40h超</th><th>60h超</th><th>深夜</th><th>休日労働</th><th>健康判定用</th><th>年間累計</th><th>上限超の月</th><th class="l">状態</th></tr>' +
+      a.rows.map(function (x) {
+        var t = x.totals, st = t.health > 4800 ? ['over', '健康：80h超'] : [t.stage, STAGE[t.stage]];
+        if (x.annual.stages.indexOf('annual_warn') >= 0 && st[0] !== 'over') st = ['warn', '年間：600h超'];
+        return '<tr><td class="l">' + esc(x.emp.name) + '</td><td class="l">' + TYPE[x.emp.work_type] + '</td><td class="num">' + hm(t.limit) + '</td><td class="num">' + hm(t.ot36) + (t.projection ? '<small>（見込）</small>' : '') + '</td><td class="num">' + hm(t.w40) + '</td><td class="num">' + hm(t.over60) + '</td><td class="num">' + hm(t.night) + '</td><td class="num">' + hm(t.hol) + '</td><td class="num">' + hm(t.health) + '</td><td class="num">' + hm(x.annual.total) + '</td><td class="num">' + x.annual.overCount + '／6回</td><td class="l"><span class="pill ' + st[0] + '">' + st[1] + '</span></td></tr>';
+      }).join('') + '</table></div>';
+  }
+  var done = a.rows.filter(function (x) { return x.status.approved; }).length;
+  var past = S.adminYm < curYm();
+  var readyA = a.rows.filter(function (x) { return x.status.confirmed && !x.status.approved && !x.status.closed; }).length;
+  var h = tabs + nav + '<div class="tbl-wrap"><table class="t"><tr><th>氏名</th><th class="l">勤務区分</th><th>出勤日数</th><th>実労働</th><th>残業<br><small>帳票④</small></th><th>週40h超</th><th>深夜</th><th>当月割増</th><th>休日労働</th><th>不足</th><th>充当<br><small>休日・残業</small></th><th>控除対象</th><th>有休</th><th>他の休</th><th>要対応</th><th class="l">本人</th><th class="l">承認者</th><th></th></tr>' +
+    a.rows.map(function (x) {
+      var t = x.totals;
+      return '<tr><td class="l">' + esc(x.emp.name) + '</td><td class="l">' + TYPE[x.emp.work_type] + '</td><td class="num">' + t.workDays + '日</td><td class="num">' + hm(t.work) + '</td><td class="num">' + hm(t.formOt) + '</td><td class="num">' + hm(t.w40) + '</td><td class="num">' + hm(t.night) + '</td><td class="num">' + hm(t.premium) + '</td><td class="num">' + hm(t.hol) + '</td><td class="num">' + (t.lack ? hm(t.lack) : '') + '</td><td class="num">' + (t.lackHol || t.lackOt ? hm(t.lackHol) + '・' + hm(t.lackOt) : '') + '</td><td class="num">' + (t.lackLeft ? '<b>' + hm(t.lackLeft) + '</b>' : '') + '</td><td class="num">' + t.paid + '</td><td class="num">' + t.other + '</td><td class="num">' + (t.issues ? '<span style="color:var(--out)">' + t.issues + '日</span>' : '') + '</td>' +
+        '<td class="l">' + (x.status.confirmed ? '<span class="pill ok">確定</span>' : '<span class="pill x">未確定</span>') + '</td><td class="l">' + (x.status.approved ? '<span class="pill ok">承認</span>' : (x.status.confirmed ? '<button class="btn ghost sm" data-act="approveMonthAdmin" data-arg="' + x.emp.emp_id + '">承認する</button>' : '<span class="pill c">待ち</span>')) + '</td>' +
+        '<td><button class="btn ghost sm" data-act="viewEmp" data-arg="' + x.emp.emp_id + '" data-ym="' + a.ym + '">日別</button></td></tr>';
+    }).join('') + '</table></div>';
+  h += '<p class="note" style="margin-top:6px">不足＝平日の遅刻・早退・中抜けで所定に届かない時間。同じ月の休日出勤・平日残業で充当し、残りが控除対象。充当した残業・休日出勤にも割増（週40h超・深夜・法定休日）は付きます</p>';
+  if (readyA > 1 && !a.closed) h += '<div class="bulkbar" style="margin-top:12px"><span>確定済み・未承認 ' + readyA + '名</span><button class="btn primary sm" data-act="approveMonthBulkAdmin" ' + (S.busy ? 'disabled' : '') + '>' + readyA + '名をまとめて承認</button></div>';
+  if (a.closed) {
+    h += '<div class="closebox"><p>締め済み（' + esc(a.close.closed_at.slice(0, 16).replace('T', ' ')) + '）。' + (a.close.csv_daily_url ? '<a href="' + esc(a.close.csv_daily_url) + '">日次CSV</a>・<a href="' + esc(a.close.csv_monthly_url) + '">月次CSV</a>をダウンロード' : '') + '</p></div>';
+  } else if (past) {
+    h += '<div class="closebox"><p>' + (done < a.rows.length ? '未承認が ' + (a.rows.length - done) + '名 います。全員の承認後に締められます。' : '全員の承認がそろいました。締めると' + ymLabel(a.ym) + 'は変更できなくなります。') + '</p><button class="btn primary" data-act="closeMonth" ' + (done < a.rows.length || S.busy ? 'disabled' : '') + '>' + ymLabel(a.ym) + 'を締める</button></div>';
+  }
+  h += '<div class="closebox"><p><b>勤務表兼残業表</b><br>テンプレートに転記し、Excel（計算済み）とPDF（A4横2枚／人）を作ります。転記後に当月残業時間・当月割増を読み戻して照合し、一致しない場合はPDFを作りません。全員分は1分ほどかかります。</p>' +
+    '<select data-f="formTarget" aria-label="対象"><option value="ALL">全員</option>' + a.rows.map(function (x) { return '<option value="' + x.emp.emp_id + '" ' + (S.formTarget === x.emp.emp_id ? 'selected' : '') + '>' + esc(x.emp.name) + '</option>'; }).join('') + '</select>' +
+    '<button class="btn primary" data-act="buildForms" ' + (S.busy ? 'disabled' : '') + '>帳票を作成</button></div>';
+  if (S.formResult) {
+    var f = S.formResult;
+    h += '<div class="alert ' + (f.stopped ? '' : 'info') + '" style="margin-top:12px"><b>' + (f.stopped ? '照合で差異があったためPDFを作成していません' : '帳票を作成しました') + '</b>' +
+      '<div class="act">' + (f.pdfUrl ? '<a class="link-btn" href="' + esc(f.pdfUrl) + '" target="_blank" rel="noopener">PDFを開く</a>' : '') + '<a class="link-btn" href="' + esc(f.xlsxUrl) + '">' + (f.xlsxZip ? 'Excelをまとめてダウンロード（zip）' : 'Excelをダウンロード') + '</a></div>' +
+      f.results.filter(function (r) { return r.problems.length; }).map(function (r) { return '<p>' + esc(r.name) + '：' + r.problems.map(esc).join('、') + '</p>'; }).join('') + '</div>';
+  }
+  return h;
+}
+
+/* ===================== マスタ・保守 ===================== */
+var MASTER_HELP = {
+  employees: '権限：staff＝一般、approver＝承認者、admin＝管理者。勤務区分：fixed＝固定時間制、flex＝フレックス、disc＝裁量労働、manager＝管理職。上限区分：general＝月42時間、restricted＝月40時間。勤務区分の変更は「変更後の勤務区分」と「変更日」で予約します（夜間処理で反映）。メールアドレスが空欄の人はログインできません',
+  holidays: '区分：company＝会社休日（祝日・年末年始など）、legal＝法定休日（日曜以外を法定休日にする日）、work＝出勤日（土日を出勤日にする日）',
+  rules: '値を変えると、次の操作から計算に反映されます（締め済みの月は変わりません）',
+  agreement36: '時間は分で入力します（例：42時間＝2520）',
+  form_map: '帳票テンプレート（入力用シート）の転記先のセル番地。日別の項目は1日の行を指定します'
+};
+var MASTER_WIDE = { email: 1, approver_email: 1, note: 1, memo: 1, name: 1 };
+function loadMaster(table) {
+  S.masterTable = table; S.master = null; render();
+  call('apiMasterGet', table).then(function (d) { setMaster(d); render(); }).catch(fail);
+  if (!S.mail) adminFetch('/admin/mail').then(function (m) { S.mail = m; render(); }).catch(function () {});
+}
+function setMaster(d) { S.master = { table: d.table, data: d, rows: JSON.parse(JSON.stringify(d.rows)), dirty: false }; }
+function masterInput(el) {
+  var p = el.dataset.mf.split('|'), row = S.master.rows[Number(p[0])], col = p[1], type = el.dataset.t;
+  row[col] = type === 'b' ? el.checked : (type === 'n' ? (el.value.trim() === '' ? null : Number(el.value)) : el.value);
+  if (!S.master.dirty) { S.master.dirty = true; var d = $('mdirty'); if (d) d.textContent = '保存していない変更があります'; var b = $('msave'); if (b) b.disabled = false; var r = $('mreset'); if (r) r.disabled = false; }
+}
+function masterCell(i, c, v, choices) {
+  var key = i + '|' + c.name;
+  if (c.type === 'b') return '<input type="checkbox" data-mf="' + key + '" data-t="b" ' + (v ? 'checked' : '') + ' aria-label="' + esc(c.label) + '">';
+  if (choices) return '<select data-mf="' + key + '" data-t="s" aria-label="' + esc(c.label) + '">' + choices.map(function (o) { return '<option value="' + esc(o) + '" ' + (o === (v || '') ? 'selected' : '') + '>' + (o === '' ? '—' : esc(o)) + '</option>'; }).join('') + '</select>';
+  return '<input type="text" class="' + (MASTER_WIDE[c.name] ? 'w-l' : (c.type === 'n' ? 'w-s' : '')) + '" ' + (c.type === 'n' ? 'inputmode="numeric"' : '') + ' data-mf="' + key + '" data-t="' + c.type + '" value="' + esc(v == null ? '' : v) + '" aria-label="' + esc(c.label) + '">';
+}
+function viewMaster() {
+  var M = S.master, h = '';
+  var seg = '<div class="seg" style="max-width:640px">' + [['employees', '社員'], ['holidays', '休日'], ['rules', '設定'], ['agreement36', '36協定'], ['form_map', '帳票の番地']].map(function (t) { return '<button aria-pressed="' + (S.masterTable === t[0]) + '" data-act="masterTable" data-arg="' + t[0] + '">' + t[1] + '</button>'; }).join('') + '</div>';
+  if (!M || M.table !== S.masterTable) return seg + '<p class="loading">読み込んでいます…</p>';
+  var D = M.data;
+  h += seg + '<p class="note" style="margin-bottom:8px">' + esc(MASTER_HELP[D.table] || '') + '</p>';
+  h += '<div class="mtools"><button class="btn ghost sm" data-act="masterAdd">行を追加</button>' +
+    (D.table === 'holidays' ? '<input id="hyear" inputmode="numeric" value="' + (Number(curYm().slice(0, 4)) + 1) + '" aria-label="年"><button class="btn ghost sm" data-act="importHolidays">この年の祝日を取り込む</button>' : '') +
+    '<span class="grow"></span><span class="dirty" id="mdirty">' + (M.dirty ? '保存していない変更があります' : '') + '</span>' +
+    '<button class="btn ghost sm" id="mreset" data-act="masterReset" ' + (M.dirty ? '' : 'disabled') + '>元に戻す</button>' +
+    '<button class="btn primary sm" id="msave" data-act="masterSave" ' + (M.dirty && !S.busy ? '' : 'disabled') + '>保存</button></div>';
+  h += '<div class="tbl-wrap"><table class="t m"><tr>' + D.columns.map(function (c) { return '<th class="l">' + esc(c.label) + '<br><small>' + esc(c.name) + '</small></th>'; }).join('') + '<th></th></tr>' +
+    M.rows.map(function (r, i) {
+      return '<tr>' + D.columns.map(function (c) { return '<td class="l">' + masterCell(i, c, r[c.name], D.choices[c.name]) + '</td>'; }).join('') +
+        '<td><button class="btn ghost sm" data-act="masterDel" data-arg="' + i + '" aria-label="' + (i + 1) + '行目を削除">削除</button></td></tr>';
+    }).join('') + '</table></div>';
+  // メール・データ・保守
+  var m = S.mail;
+  h += '<div class="panel"><h3>メール送信</h3>' + (!m ? '<p>確認しています…</p>' :
+    m.mode === 'gmail' ? '<p>' + esc(m.sender) + ' の Gmail から送信しています。</p><div class="row"><button class="btn ghost sm" data-act="mailTest">テストメールを自分に送る</button><button class="btn ghost sm" data-act="mailOff">接続を解除</button></div>' :
+    m.mode === 'smtp' ? '<p>SMTP（' + esc(m.sender) + '）で送信しています。</p><div class="row"><button class="btn ghost sm" data-act="mailTest">テストメールを自分に送る</button></div>' :
+    '<p>通知メールの送信元が未設定です。送信に使う社用アカウント（例：自分）で接続してください。そのアカウントの Gmail から送信します。</p><div class="row">' + (m.oauth ? '<a class="btn primary sm" href="/auth/gmail">Googleアカウントを接続</a>' : '<span class="note">Googleログイン（GOOGLE_CLIENT_ID）の設定後に接続できます</span>') + '</div>') + '</div>';
+  h += '<div class="panel"><h3>データ</h3><p>全テーブルを1つの Excel（シート＝テーブル）でダウンロードできます。バックアップ・分析・他システムへの移行に使えます。取り込みは旧スプレッドシートからの移行や復元に使います。</p><div class="row"><a class="btn ghost sm" href="/export/data.xlsx">全データをダウンロード</a><a class="btn ghost sm" href="/admin/import">データ取り込み</a></div></div>';
+  h += '<div class="panel"><h3>保守</h3><p>締めの取り消しは、締めた月の勤怠を直す必要があるときに使います。アーカイブは、締め済みの古い記録をCSVに書き出してから消します（月次の集計は残ります）。</p>' +
+    '<div class="row"><input id="reopenYm" placeholder="2026-12" aria-label="締めを取り消す月"><button class="btn ghost sm" data-act="reopenMonth">締めを取り消す</button></div>' +
+    '<div class="row" style="margin-top:8px"><input id="archiveDate" placeholder="2027-04-01" aria-label="この日より前をアーカイブ"><button class="btn ghost sm" data-act="archive">より前をアーカイブ</button></div></div>';
+  return h;
+}
+
+/* ===================== 描画 ===================== */
+function renderTabs() {
+  var b = S.boot, tabs = [['punch', '打刻'], ['log', 'マイ勤怠'], ['apply', '申請']];
+  if (b.isApprover) tabs.push(['approve', '承認']);
+  if (b.isAdmin) tabs.push(['admin', '管理']);
+  var n = S.home ? S.home.issues.length + (!S.home.prev.status.confirmed && !S.home.prev.status.closed ? 1 : 0) : 0;
+  var p = S.appr ? S.appr.pending.length : 0;
+  $('tabs').innerHTML = tabs.map(function (t) {
+    var badge = t[0] === 'punch' && n ? '<span class="dot">' + n + '</span>' : t[0] === 'approve' && p ? '<span class="dot">' + p + '</span>' : '';
+    return '<button data-act="tab" data-arg="' + t[0] + '" aria-current="' + (S.tab === t[0] ? 'page' : 'false') + '">' + t[1] + badge + '</button>';
+  }).join('');
+}
+function render() {
+  if (!S.boot) return;
+  renderTabs();
+  $('who').textContent = S.boot.me.name + '（' + TYPE[S.boot.me.work_type] + '）';
+  var main = $('main');
+  main.className = 'main' + (S.tab === 'admin' ? ' wide' : '');
+  main.innerHTML = S.tab === 'punch' ? viewPunch() : S.tab === 'log' ? viewLog() : S.tab === 'apply' ? viewApply() : S.tab === 'approve' ? viewApprove() : viewAdmin();
+  var sh = S.sheet, html = '';
+  if (sh) html = sh.kind === 'day' ? sheetDay(sh.date) : sh.kind === 'dev' ? sheetDev(sh) : sh.kind === 'brk' ? sheetBrk(sh) : sheetForm(sh);
+  $('sheet-root').innerHTML = html ? '<div class="sheet-wrap" data-act="bg"><div class="sheet" role="dialog" aria-modal="true">' + html + '</div></div>' : '';
+  tick();
+}
+function tick() {
+  var c = $('clock');
+  if (c) { var n = jstNow(); c.innerHTML = pad(n.h) + ':' + pad(n.m) + '<small>' + pad(n.s) + '</small>'; }
+  var el = $('elapsed');
+  if (el && S.home && S.home.today.punchIn != null) el.textContent = hm(Math.max(0, nowMinClient() - S.home.today.punchIn));
+}
+setInterval(tick, 1000);
+
+/* ===================== 読み込み ===================== */
+function loadHome() { return call('apiHome').then(function (h) { S.home = h; }); }
+function loadMonth(ym) { S.ym = ym; S.month = null; render(); return call('apiMonth', ym, S.viewEmp || '').then(function (m) { S.month = m; render(); }).catch(fail); }
+function loadReqs() { return call('apiMyRequests').then(function (r) { S.reqs = r; }); }
+function loadAppr() { return Promise.all([call('apiApprovals', S.apprYm), call('apiTeam', curYm())]).then(function (r) { S.appr = r[0]; S.team = r[1]; }); }
+function loadAdmin() { var ym = S.adminYm; return call('apiAdminMonth', ym).then(function (a) { if (ym === S.adminYm) S.admin = a; render(); }).catch(fail); }
+
+function go(tab) {
+  S.tab = tab; S.sheet = null;
+  if (tab === 'punch') { render(); loadHome().then(render).catch(fail); }
+  if (tab === 'log') { if (!S.ym) S.ym = curYm(); loadMonth(S.ym); }
+  if (tab === 'apply') { render(); loadReqs().then(render).catch(fail); }
+  if (tab === 'approve') { render(); loadAppr().then(render).catch(fail); }
+  if (tab === 'admin') { render(); if (S.adminTab === 'emp') loadMaster(S.masterTable); else loadAdmin(); }
+}
+
+/* ===================== 操作 ===================== */
+function busy(p, after) {
+  S.busy = true; render();
+  return p.then(function (r) { S.busy = false; if (after) after(r); render(); }).catch(fail);
+}
+document.addEventListener('click', function (ev) {
+  var b = ev.target.closest('[data-act]');
+  if (!b || b.disabled) return;
+  var act = b.dataset.act, arg = b.dataset.arg;
+  if (act === 'bg') { if (ev.target === b) { S.sheet = null; render(); } return; }
+  switch (act) {
+    case 'tab': if (arg === 'log') S.viewEmp = null; go(arg); break;
+    case 'punch':
+      busy(call('apiPunch', arg, navigator.userAgent), function (h) {
+        S.home = h;
+        var t = h.today;
+        var msg = arg === 'IN' ? '出勤を記録しました（' + hhmm(t.punchIn) + '）' : '退勤を記録しました' + (t.punchOut != null ? '（' + hhmm(t.punchOut) + '）' : '');
+        if (arg === 'OUT' && t.flags.indexOf('DEVIATION') >= 0) msg += '。終業予定より遅いため、残業の事後申請か業務外の理由を入力してください';
+        toast(msg);
+      });
+      break;
+    case 'goMonth': S.viewEmp = null; S.tab = 'log'; loadMonth(arg); break;
+    case 'month': loadMonth(addMonths(S.ym, Number(arg))); break;
+    case 'openDay':
+      if (S.tab !== 'log' || !findDay(arg)) { S.viewEmp = null; S.tab = 'log'; loadMonth(arg.slice(0, 7)).then(function () { S.sheet = { kind: 'day', date: arg }; render(); }); }
+      else { S.sheet = { kind: 'day', date: arg }; render(); }
+      break;
+    case 'closeSheet': S.sheet = null; render(); break;
+    case 'newFix': ensureMonth(arg, function () { openForm('fix', arg); render(); }); break;
+    case 'newLeave': ensureMonth(arg, function () { openForm('leave', arg); render(); }); break;
+    case 'newPre': ensureMonth(arg, function () { openForm('pre', arg, b.dataset.post === '1'); render(); }); break;
+    case 'newApp': openForm(S.boot.me.work_type === 'fixed' ? 'pre' : 'fix', ''); render(); break;
+    case 'formKind': S.sheet.fkind = arg; S.sheet.err = ''; render(); break;
+    case 'submit': {
+      var sh = S.sheet;
+      busy(call('apiSubmitRequest', { kind: sh.fkind, date: sh.date, preStart: sh.preStart, preEnd: sh.preEnd, inTime: sh.inTime, outTime: sh.outTime, leaveType: sh.leaveType, reason: sh.reason }), function (r) {
+        S.reqs = r; S.sheet = null; toast('申請しました。承認されると勤怠に反映されます');
+        if (S.tab === 'log' && S.ym) loadMonth(S.ym); else if (S.tab === 'punch') loadHome().then(render);
+      }).catch(function () {});
+      break;
+    }
+    case 'cancelReq': busy(call('apiCancelRequest', arg), function (r) { S.reqs = r; toast('申請を取り下げました'); }); break;
+    case 'devForm': S.sheet = { kind: 'dev', date: arg, note: '', err: '' }; render(); break;
+    case 'devClear': busy(call('apiSaveDayInput', { date: arg, deviation: '', deviationNote: '' }), function (m) { S.month = m; toast('「業務外」の申告を取り消しました'); }); break;
+    case 'saveDev': {
+      var d = S.sheet;
+      if (!String(d.note || '').trim()) { d.err = '理由を入力してください'; render(); break; }
+      busy(call('apiSaveDayInput', { date: d.date, deviation: 'non_work', deviationNote: d.note }), function (m) { S.month = m; S.sheet = { kind: 'day', date: d.date }; toast('業務外として記録しました'); });
+      break;
+    }
+    case 'brkForm': { var dd = findDay(arg); S.sheet = { kind: 'brk', date: arg, min: dd ? dd.extraBreak : 0, note: dd ? dd.extraBreakNote : '', err: '' }; render(); break; }
+    case 'saveBrk': {
+      var k = S.sheet;
+      if (+k.min && !String(k.note || '').trim()) { k.err = '事由を入力してください'; render(); break; }
+      busy(call('apiSaveDayInput', { date: k.date, extraBreak: +k.min, extraBreakNote: k.note }), function (m) { S.month = m; S.sheet = { kind: 'day', date: k.date }; toast(+k.min ? '休憩等 ' + hm(+k.min) + ' を記録しました' : '休憩等を取り消しました'); });
+      break;
+    }
+    case 'confirm': busy(call('apiConfirmMonth', S.ym), function (m) { S.month = m; toast(ymLabel(S.ym) + 'を確定しました。承認者に通知しました'); loadHome().then(render); }); break;
+    case 'approve': busy(call('apiDecide', arg, true, '', S.appr.ym), function (a) { S.appr = a; toast('承認しました'); }); break;
+    case 'reject': S.rejecting = arg; render(); break;
+    case 'rejectCancel': S.rejecting = null; render(); break;
+    case 'rejectSend': {
+      var cm = ($('rejectComment') || {}).value || '';
+      busy(call('apiDecide', arg, false, cm, S.appr.ym), function (a) { S.appr = a; S.rejecting = null; toast('差し戻しました'); });
+      break;
+    }
+    case 'apprMonth': S.apprYm = addMonths(S.appr.ym, Number(arg)); S.appr = null; render(); loadAppr().then(render).catch(fail); break;
+    case 'approveBulk': {
+      var ids = selectedIds();
+      if (!ids.length) break;
+      if (!confirm('選択した' + ids.length + '件の申請を承認します。よろしいですか？')) break;
+      busy(call('apiDecideBulk', ids, S.appr.ym), function (r) { S.appr = r.appr; S.sel = {}; bulkToast(r); });
+      break;
+    }
+    case 'approveMonthBulk':
+      if (!confirm(ymLabel(S.appr.ym) + 'の確定済みの勤怠をまとめて承認します。よろしいですか？')) break;
+      busy(call('apiApproveMonthBulk', [], S.appr.ym), function (r) { if (r.appr) S.appr = r.appr; bulkToast(r); });
+      break;
+    case 'approveMonthBulkAdmin':
+      if (!confirm(ymLabel(S.adminYm) + 'の確定済みの勤怠をまとめて承認します。よろしいですか？')) break;
+      busy(call('apiApproveMonthBulk', [], S.adminYm), function (r) { bulkToast(r); loadAdmin(); });
+      break;
+    case 'masterTable':
+      if (S.master && S.master.dirty && !confirm('保存していない変更があります。破棄して切り替えますか？')) break;
+      loadMaster(arg); break;
+    case 'masterAdd': {
+      var blank = {};
+      S.master.data.columns.forEach(function (c) { blank[c.name] = c.type === 'b' ? (c.name === 'active') : (c.type === 'n' ? null : ''); });
+      if (S.master.table === 'employees') Object.assign(blank, { role: 'staff', work_type: 'fixed', limit_class: 'general', sched_start: '8:30', sched_end: '17:30', sched_min: 480, deemed_min: 480, division: 'デジプル' });
+      if (S.master.table === 'holidays') blank.kind = 'company';
+      S.master.rows.push(blank); S.master.dirty = true; render();
+      break;
+    }
+    case 'masterDel': S.master.rows.splice(Number(arg), 1); S.master.dirty = true; render(); break;
+    case 'masterReset': S.master.rows = JSON.parse(JSON.stringify(S.master.data.rows)); S.master.dirty = false; render(); break;
+    case 'masterSave':
+      busy(call('apiMasterSave', S.master.table, S.master.rows), function (d) { setMaster(d); toast(d.title + 'を保存しました'); });
+      break;
+    case 'importHolidays': {
+      var y = Number(($('hyear') || {}).value);
+      if (S.master.dirty && !confirm('保存していない変更は破棄されます。取り込みますか？')) break;
+      busy(call('apiImportHolidays', y), function (d) { setMaster(d); toast(y + '年の祝日を' + d.added + '件取り込みました'); });
+      break;
+    }
+    case 'mailTest': adminFetch('/admin/mail/test', 'POST').then(function (m) { S.mail = m; toast('自分あてにテストメールを送りました。届いたか確認してください'); render(); }).catch(fail); break;
+    case 'mailOff':
+      if (!confirm('メール送信の接続を解除します。通知メールは送られなくなります。よろしいですか？')) break;
+      adminFetch('/admin/mail/disconnect', 'POST').then(function (m) { S.mail = m; render(); }).catch(fail); break;
+    case 'reopenMonth': {
+      var ym2 = ($('reopenYm') || {}).value;
+      if (!/^\d{4}-\d{2}$/.test(ym2 || '')) { toast('月を yyyy-MM で入力してください', true); break; }
+      if (!confirm(ymLabel(ym2) + 'の締めを取り消します。よろしいですか？')) break;
+      busy(call('apiReopenMonth', ym2), function () { toast(ymLabel(ym2) + 'の締めを取り消しました'); });
+      break;
+    }
+    case 'archive': {
+      var dt = ($('archiveDate') || {}).value;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dt || '')) { toast('日付を yyyy-MM-dd で入力してください', true); break; }
+      if (!confirm(dt + 'より前の打刻・申請・日次の記録をCSVに書き出してから消します。よろしいですか？')) break;
+      busy(call('apiArchiveBefore', dt), function (r) { toast(r.moved ? r.moved + '件をCSVに書き出して消しました（監査ログにファイルの場所を記録）' : '対象の記録はありません'); });
+      break;
+    }
+    case 'approveMonth': busy(call('apiApproveMonth', arg, S.appr.ym), function (a) { S.appr = a; toast('承認しました'); }); break;
+    case 'approveMonthAdmin': busy(call('apiApproveMonth', arg, S.adminYm), function () { toast('承認しました'); loadAdmin(); }); break;
+    case 'viewEmp': S.viewEmp = arg; S.backTab = S.tab; S.tab = 'log'; loadMonth(b.dataset.ym || curYm()); break;
+    case 'backFromEmp': S.viewEmp = null; go(S.backTab || 'approve'); break;
+    case 'adminTab': S.adminTab = arg; go('admin'); break;
+    case 'adminMonth': S.adminYm = addMonths(S.adminYm, Number(arg)); S.admin = null; S.formResult = null; render(); loadAdmin(); break;
+    case 'closeMonth':
+      if (!confirm(ymLabel(S.adminYm) + 'を締めます。締めた後は変更できません。よろしいですか？')) break;
+      busy(call('apiCloseMonth', S.adminYm), function (r) { S.admin = r.month; toast(ymLabel(S.adminYm) + 'を締めました。CSVを保存しました'); });
+      break;
+    case 'buildForms': busy(call('apiBuildForms', S.adminYm, S.formTarget), function (r) { S.formResult = r; toast(r.stopped ? '照合で差異がありました。内容を確認してください' : '帳票を作成しました'); }); break;
+  }
+});
+function selectedIds() {
+  if (!S.appr) return [];
+  return S.appr.pending.filter(function (r) { return S.sel[r.req_id]; }).map(function (r) { return r.req_id; });
+}
+function bulkToast(r) {
+  if (!r.failed.length) return toast(r.done + '件を承認しました');
+  toast(r.done + '件を承認しました。承認できなかったもの：' + r.failed.map(function (f) { return f.label + '（' + f.message + '）'; }).join('、'), true);
+}
+function ensureMonth(date, fn) {
+  if (S.month && S.month.ym === date.slice(0, 7) && !S.viewEmp) return fn();
+  S.viewEmp = null;
+  call('apiMonth', date.slice(0, 7), '').then(function (m) { S.month = m; S.ym = m.ym; fn(); }).catch(fail);
+}
+document.addEventListener('input', function (ev) {
+  var el = ev.target, f = el.dataset.f;
+  if (el.dataset.mf) { masterInput(el); return; }
+  if (!f) return;
+  if (f === 'formTarget') { S.formTarget = el.value; return; }
+  if (S.sheet) S.sheet[f] = el.value;
+});
+document.addEventListener('change', function (ev) {
+  var el = ev.target, f = el.dataset.f;
+  if (el.dataset.mf) { masterInput(el); return; }
+  if (el.dataset.sel) { if (el.checked) S.sel[el.dataset.sel] = true; else delete S.sel[el.dataset.sel]; render(); return; }
+  if (el.dataset.selall) { S.sel = {}; if (el.checked && S.appr) S.appr.pending.forEach(function (r) { S.sel[r.req_id] = true; }); render(); return; }
+  if (!f) return;
+  if (f === 'formTarget') { S.formTarget = el.value; return; }
+  if (!S.sheet) return;
+  S.sheet[f] = el.value;
+  if (el.dataset.refill && S.sheet.kind === 'form') {
+    var date = el.value;
+    if (date && S.month && S.month.ym === date.slice(0, 7)) { fillFromDay(S.sheet, findDay(date), false); render(); }
+  }
+  if (el.tagName === 'SELECT') render();
+});
+document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape' && S.sheet) { S.sheet = null; render(); } });
+
+/* ===================== 起動 ===================== */
+call('apiBootstrap').then(function (b) {
+  S.boot = b; S.apprYm = addMonths(b.today.slice(0, 7), -1); S.adminYm = addMonths(b.today.slice(0, 7), -1);
+  if (location.hash === '#mail-connected' && b.isAdmin) {
+    history.replaceState(null, '', '/');
+    S.adminTab = 'emp'; go('admin'); toast('メール送信のアカウントを接続しました。テストメールで確認してください');
+    return;
+  }
+  render();
+  return loadHome().then(function () { render(); if (b.isApprover) loadAppr().then(renderTabs).catch(function () {}); });
+}).catch(function (e) {
+  $('main').innerHTML = '<div class="alert"><b>開けませんでした</b><br>' + esc(e && e.message ? e.message.replace(/^Error:\s*/, '') : e) + '<div class="act"><a class="link-btn" href="/logout">別のアカウントでログイン</a></div></div>';
+});
+</script>

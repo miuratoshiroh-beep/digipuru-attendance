@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>勤怠 | ログイン</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#14213a;--mute:#5b6577;--bg:#eef1f5;--card:#fff;--in:#1f5fbf;--out:#b3261e}
+@media (prefers-color-scheme: dark){:root{--ink:#e7ebf2;--mute:#9aa4b5;--bg:#10151f;--card:#18202d;--in:#7fb0ff;--out:#ff8a80}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--ink);font-family:'IBM Plex Sans JP',system-ui,sans-serif;padding:16px}
+.box{background:var(--card);border-radius:18px;padding:36px 28px;width:100%;max-width:380px;box-shadow:0 10px 30px rgba(20,33,58,.08)}
+h1{margin:0 0 4px;font-size:26px;letter-spacing:.04em}
+p{color:var(--mute);margin:0 0 24px;font-size:14px;line-height:1.7}
+a.go{display:flex;align-items:center;justify-content:center;gap:10px;height:52px;border-radius:12px;background:var(--in);color:#fff;text-decoration:none;font-weight:600;font-size:16px}
+a.go:focus-visible{outline:3px solid var(--ink);outline-offset:2px}
+.err{color:var(--out);font-size:14px;margin:0 0 16px}
+.dev{margin-top:20px;display:flex;gap:8px}.dev input{flex:1;padding:10px;border-radius:8px;border:1px solid var(--mute);background:transparent;color:var(--ink)}.dev button{padding:10px 12px;border-radius:8px;border:0;background:var(--mute);color:#fff}
+</style>
+</head>
+<body>
+<main class="box">
+  <h1>勤怠</h1>
+  <p>デジプルの出退勤・残業の記録です。社用のGoogleアカウントでログインしてください。</p>
+  {{MSG}}
+  <a class="go" href="/auth/google">Googleでログイン</a>
+  {{DEV}}
+</main>
+</body>
+</html>

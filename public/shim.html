@@ -1,0 +1,29 @@
+<script>
+/* google.script.run の代わり：POST /api/関数名 に引数の配列を送る（画面のコードは GAS 版のまま） */
+window.google = { script: { run: (function () {
+  function make(ok, ng) {
+    return new Proxy({}, { get: function (_, k) {
+      if (k === 'withSuccessHandler') return function (f) { return make(f, ng); };
+      if (k === 'withFailureHandler') return function (f) { return make(ok, f); };
+      return function () {
+        var args = Array.prototype.slice.call(arguments);
+        fetch('/api/' + k, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'fetch' }, body: JSON.stringify(args) })
+          .then(function (res) {
+            if (res.status === 401) { location.href = '/login'; return new Promise(function () {}); }
+            return res.json().catch(function () { return { error: '通信に失敗しました（' + res.status + '）' }; }).then(function (j) {
+              if (!res.ok || j.error) throw new Error(j.error || ('通信に失敗しました（' + res.status + '）'));
+              return j.result;
+            });
+          }, function () { throw new Error('サーバーにつながりません。通信状況を確認してください'); })
+          .then(function (r) { if (ok) ok(r); }, function (e) { if (ng) ng(e); });
+      };
+    } });
+  }
+  return make(null, null);
+})() } };
+/* 管理画面の補助（メール送信の状態など。POST は同じヘッダーを付ける） */
+function adminFetch(url, method) {
+  return fetch(url, { method: method || 'GET', credentials: 'same-origin', headers: { 'X-Requested-With': 'fetch' } })
+    .then(function (res) { return res.json().then(function (j) { if (!res.ok || j.error) throw new Error(j.error || res.status); return j.result; }); });
+}
+</script>
