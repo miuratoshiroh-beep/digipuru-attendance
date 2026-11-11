@@ -241,9 +241,39 @@ async function main() {
   await store.acquireWriterLock(() => log('info', '前のインスタンスの終了を待っています'));
   await engine.init();
   if (!pool && DEV_LOGIN && env.DEV_SEED) await require(path.resolve(env.DEV_SEED))(engine);
+  await importFromEnv();
   log('info', 'ready');
   jobs = startJobs({ engine, store, log });
 }
+/**
+ * 環境変数 IMPORT_DATA（{ tables: { テーブル名: [[列名...], [値...], ...] } } を gzip→base64）からの取り込み
+ * 画面にログインできない状態での初期移行用。同じ内容は1回だけ（job_runs に記録）。取り込み後は変数を消す
+ */
+async function importFromEnv() {
+  if (!env.IMPORT_DATA) return;
+  const zlib = require('zlib');
+  const raw = Buffer.from(env.IMPORT_DATA, 'base64');
+  const hash = crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16);
+  if (!(await store.claimJob('import_env', hash))) { log('info', 'IMPORT_DATA ' + hash + ' は取り込み済み。変数を消してください'); return; }
+  const data = JSON.parse(zlib.gunzipSync(raw).toString('utf8'));
+  const tables = {};
+  for (const [name, rows] of Object.entries(data.tables || {})) {
+    if (!schema[name]) continue;
+    const head = rows[0];
+    tables[name] = rows.slice(1).map(r => { const o = {}; head.forEach((h, i) => { o[h] = r[i]; }); return o; });
+  }
+  const res = await engine.internal('system', c => {
+    const counts = {};
+    Object.keys(tables).forEach(n => { c.Repo.replaceWhere(n, () => true, tables[n]); counts[n] = tables[n].length; });
+    c.Domain.audit('import', 'IMPORT_DATA ' + hash, counts);
+    c.Repo.clearCache();
+    return { counts, warnings: c.Monthly.validateSettings(c.Domain.ctx()) };
+  });
+  await engine.seedDefaults();
+  await store.finishJob('import_env', hash, JSON.stringify(res));
+  log('info', 'IMPORT_DATA ' + hash + ' imported', JSON.stringify(res));
+}
+
 async function shutdown(sig) {
   log('info', 'shutdown ' + sig);
   if (jobs) jobs.stop();
