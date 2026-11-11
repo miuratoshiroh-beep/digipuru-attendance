@@ -45,6 +45,8 @@ if (!env.DATABASE_URL && !DEV_LOGIN) { log('error', 'DATABASE_URL を設定し�
 
 const schema = loadSchema();
 const pool = env.DATABASE_URL ? new Pool({ connectionString: env.DATABASE_URL, max: 5 }) : null;
+// 待機中の接続が切れても落ちない（次の処理で接続し直す）
+if (pool) pool.on('error', e => log('warn', 'pg idle client error', e.message));
 const store = pool ? new PgStore(pool, schema) : new MemoryStore(schema);
 const mailer = createMailer({ pool, log, oauth: OAUTH });
 const engine = createEngine({ store, appUrl: APP_URL, log, sendMail: m => mailer.send(m) });

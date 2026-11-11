@@ -43,6 +43,8 @@ class PgStore {
   /** 書き込み担当の確保。取れるまで待つ（前のインスタンスが止まるまで） */
   async acquireWriterLock(onWait) {
     this.lockClient = await this.pool.connect();
+    // ロックを持つ接続が切れたら書き込み担当でなくなるため、プロセスを終了して再起動に任せる
+    this.lockClient.on('error', e => { console.error('writer lock connection lost:', e.message); process.exit(1); });
     for (;;) {
       const r = await this.lockClient.query('SELECT pg_try_advisory_lock($1) AS ok', [LOCK_KEY]);
       if (r.rows[0].ok) return;
